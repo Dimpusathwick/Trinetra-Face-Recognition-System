@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Face ID Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; background:#0f172a; color:#e2e8f0; }
+  header { padding:16px 24px; background:#111827; border-bottom:1px solid #1f2937; }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
+  h1 { margin:0; font-size: 20px; }
+  .grid { display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background:#111827; border:1px solid #1f2937; border-radius:12px; padding:16px; box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+  .card h2 { margin-top:0; font-size:16px; color:#93c5fd; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type="text"] { flex:1; min-width:160px; padding:8px 10px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:#e2e8f0; }
+  input[type="file"] { color:#e2e8f0; }
+  button { padding:8px 12px; border:none; border-radius:8px; background:#2563eb; color:white; cursor:pointer; }
+  button.secondary { background:#374151; }
+  button.danger { background:#dc2626; }
+  button.success { background:#16a34a; }
+  pre { white-space:pre-wrap; word-break:break-word; background:#0b1220; padding:12px; border-radius:8px; border:1px solid #334155; color:#d1d5db; max-height:260px; overflow:auto; }
+  small { color:#94a3b8; }
+  .kbd { background:#0b1220; border:1px solid #334155; padding:2px 6px; border-radius:6px; font-size:12px; }
+  video, canvas { border-radius:8px; background:#000; }
+  .webcam-container { text-align:center; margin:8px 0; }
+  .status { padding: 8px; margin: 8px 0; border-radius: 6px; }
+  .status.success { background: #065f46; color: #d1fae5; }
+  .status.error { background: #7f1d1d; color: #fecaca; }
+</style>
+</head>
+<body>
+<header><h1>Face ID Console</h1></header>
+<main>
+  <div class="grid">
+    <div class="card">
+      <h2>Add Photo to Database</h2>
+      <div class="row">
+        <input id="personName" type="text" placeholder="Person name (e.g., Dimpu)">
+        <input id="addFile" type="file" accept="image/*">
+        <button onclick="addPhoto()">Upload</button>
+      </div>
+      <small>Uploads the image, extracts the face embedding, stores it, then refreshes centroids.</small>
+      <h3>Result</h3><pre id="addOut"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Match Photo</h2>
+      <div class="row">
+        <input id="matchFile" type="file" accept="image/*">
+        <button class="secondary" onclick="matchPhoto()">Match</button>
+      </div>
+      <small>Runs recognition against current centroids.</small>
+      <h3>Result</h3><pre id="matchOut"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Live Webcam</h2>
+      <div class="row">
+        <button onclick="startWebcam()">Start Camera</button>
+        <button class="secondary" onclick="stopWebcam()">Stop Camera</button>
+        <button class="success" onclick="captureAndAdd()">Capture & Add</button>
+      </div>
+      <div class="webcam-container">
+        <video id="webcamVideo" width="320" height="240" style="display:none;"></video>
+        <canvas id="webcamCanvas" width="320" height="240" style="display:none;"></canvas>
+      </div>
+      <div id="webcamStatus" style="margin-top:8px; color:#94a3b8;"></div>
+      <h3>Live Detection</h3><pre id="webcamOut"></pre>
+    </div>
+
+    <div class="card">
+      <h2>Persons</h2>
+      <div class="row">
+        <button class="secondary" onclick="listPersons()">Refresh List</button>
+        <button onclick="reloadCentroids()">Reload Centroids</button>
+      </div>
+      <small>Use Reload after adding/deleting photos.</small>
+      <h3>Persons</h3>
+      <div id="personsList" style="margin-bottom: 12px;"></div>
+      <pre id="personsOut"></pre>
+      <div class="row">
+        <input id="deleteName" type="text" placeholder="Exact name to delete">
+        <button class="danger" onclick="deletePerson()">Delete</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input id="updateOldName" type="text" placeholder="Current name">
+        <input id="updateNewName" type="text" placeholder="New name">
+        <button onclick="updatePersonName()">Update Name</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const base = location.origin;
+let stream = null;
+let detectionInterval = null;
+let tempPersonCounter = 1;
+
+function setOut(id, obj) {
+  try { 
+    document.getElementById(id).textContent = JSON.stringify(obj, null, 2); 
+  }
+  catch (e) { 
+    document.getElementById(id).textContent = String(obj); 
+  }
+}
+
+function setStatus(msg) {
+  document.getElementById('webcamStatus').textContent = msg;
+}
+
+function showStatus(message, isError = false) {
+  // Remove existing status
+  const existingStatus = document.querySelector('.status');
+  if (existingStatus) {
+    existingStatus.remove();
+  }
+  
+  // Create new status
+  const status = document.createElement('div');
+  status.className = `status ${isError ? 'error' : 'success'}`;
+  status.textContent = message;
+  
+  // Insert after header
+  const header = document.querySelector('header');
+  header.insertAdjacentElement('afterend', status);
+  
+  // Auto remove after 5 seconds
+  setTimeout(() => {
+    if (status.parentNode) {
+      status.remove();
+    }
+  }, 5000);
+}
+
+async function startWebcam() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    const video = document.getElementById('webcamVideo');
+    video.srcObject = stream;
+    video.style.display = 'block';
+    video.play();
+    setStatus('Camera started. Detection running...');
+    
+    // Start detection loop
+    detectionInterval = setInterval(async () => {
+      await detectFaces();
+    }, 1000); // Check every second
+    
+  } catch (e) {
+    setStatus('Error: ' + e.message);
+    setOut('webcamOut', { error: 'Camera access denied or not available' });
+  }
+}
+
+function stopWebcam() {
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+  if (detectionInterval) {
+    clearInterval(detectionInterval);
+    detectionInterval = null;
+  }
+  document.getElementById('webcamVideo').style.display = 'none';
+  document.getElementById('webcamCanvas').style.display = 'none';
+  setStatus('Camera stopped');
+  setOut('webcamOut', { status: 'stopped' });
+}
+
+async function detectFaces() {
+  const video = document.getElementById('webcamVideo');
+  const canvas = document.getElementById('webcamCanvas');
+  const ctx = canvas.getContext('2d');
+  
+  if (!stream || video.videoWidth === 0) return;
+  
+  // Draw current frame to canvas
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0);
+  
+  // Convert to blob and send for detection
+  canvas.toBlob(async (blob) => {
+    const fd = new FormData();
+    fd.append('file', blob, 'webcam.jpg');
+    
+    try {
+      const res = await fetch(`${base}/match`, { method: 'POST', body: fd });
+      const data = await res.json();
+      
+      // Strict threshold - only very similar faces match
+      const threshold = 0.6;
+      
+      if (data.match && data.similarity >= threshold) {
+        setOut('webcamOut', { 
+          detected: data.match, 
+          similarity: data.similarity,
+          status: 'known_person'
+        });
+      } else {
+        setOut('webcamOut', { 
+          detected: 'Unknown', 
+          similarity: data.similarity,
+          status: 'unknown_person'
+        });
+      }
+    } catch (e) {
+      setOut('webcamOut', { error: String(e) });
+    }
+  }, 'image/jpeg');
+}
+
+async function captureAndAdd() {
+  const video = document.getElementById('webcamVideo');
+  const canvas = document.getElementById('webcamCanvas');
+  const ctx = canvas.getContext('2d');
+  
+  if (!stream) {
+    setOut('webcamOut', { error: 'Start camera first' });
+    return;
+  }
+  
+  // Capture current frame
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0);
+  
+  // Generate temporary name
+  const tempName = `Person_${tempPersonCounter++}`;
+  
+  // Convert to blob and send
+  canvas.toBlob(async (blob) => {
+    const fd = new FormData();
+    fd.append('person_name', tempName);
+    fd.append('file', blob, 'capture.jpg');
+    
+    try {
+      const res = await fetch(`${base}/add_photo`, { method: 'POST', body: fd });
+      const data = await res.json();
+      setOut('webcamOut', { 
+        ...data, 
+        message: `Added as ${tempName}. You can update the name later.`
+      });
+      // Refresh persons list
+      await listPersons();
+    } catch (e) {
+      setOut('webcamOut', { error: String(e) });
+    }
+  }, 'image/jpeg');
+}
+
+async function addPhoto() {
+  const name = document.getElementById('personName').value.trim();
+  const file = document.getElementById('addFile').files[0];
+  
+  if (!name) {
+    setOut('addOut', { error: 'Name is required' });
+    showStatus('Please enter a person name', true);
+    return;
+  }
+  if (!file) {
+    setOut('addOut', { error: 'Choose an image' });
+    showStatus('Please select an image file', true);
+    return;
+  }
+  
+  const fd = new FormData();
+  fd.append('person_name', name);
+  fd.append('file', file);
+  
+  try {
+    const r = await fetch(`${base}/add_photo`, { method: 'POST', body: fd });
+    const data = await r.json();
+    setOut('addOut', data);
+    
+    if (data.success) {
+      showStatus(`Successfully added ${name} to database!`);
+      // Clear form
+      document.getElementById('personName').value = '';
+      document.getElementById('addFile').value = '';
+      // Refresh persons list
+      await listPersons();
+    } else {
+      showStatus(`Error: ${data.error}`, true);
+    }
+  } catch (e) {
+    setOut('addOut', { error: String(e) });
+    showStatus(`Network error: ${e.message}`, true);
+  }
+}
+
+async function matchPhoto() {
+  const file = document.getElementById('matchFile').files[0];
+  
+  if (!file) {
+    setOut('matchOut', { error: 'Choose an image' });
+    showStatus('Please select an image file', true);
+    return;
+  }
+  
+  const fd = new FormData();
+  fd.append('file', file);
+  
+  try {
+    const r = await fetch(`${base}/match`, { method: 'POST', body: fd });
+    const data = await r.json();
+    setOut('matchOut', data);
+    
+    if (data.match) {
+      showStatus(`Match found: ${data.match} (${(data.similarity * 100).toFixed(1)}% similarity)`);
+    } else {
+      showStatus('No match found');
+    }
+  } catch (e) {
+    setOut('matchOut', { error: String(e) });
+    showStatus(`Network error: ${e.message}`, true);
+  }
+}
+
+async function listPersons() {
+  try { 
+    const r = await fetch(`${base}/persons`); 
+    const data = await r.json();
+    setOut('personsOut', data);
+    
+    // Display persons in a user-friendly list
+    const personsList = document.getElementById('personsList');
+    if (data.persons && data.persons.length > 0) {
+      personsList.innerHTML = data.persons.map(person => 
+        `<div style="display: flex; justify-content: space-between; align-items: center; padding: 8px; margin: 4px 0; background: #0b1220; border-radius: 6px; border: 1px solid #334155;">
+          <span style="color: #e2e8f0;">${person.name}</span>
+          <div>
+            <button onclick="fillUpdateForm('${person.name}')" style="padding: 4px 8px; margin-left: 4px; background: #2563eb; border: none; border-radius: 4px; color: white; cursor: pointer; font-size: 12px;">Edit</button>
+            <button onclick="fillDeleteForm('${person.name}')" style="padding: 4px 8px; margin-left: 4px; background: #dc2626; border: none; border-radius: 4px; color: white; cursor: pointer; font-size: 12px;">Delete</button>
+          </div>
+        </div>`
+      ).join('');
+    } else {
+      personsList.innerHTML = '<div style="color: #94a3b8; padding: 8px;">No persons found</div>';
+    }
+  }
+  catch(e){ 
+    setOut('personsOut', { error: String(e) }); 
+    document.getElementById('personsList').innerHTML = '<div style="color: #dc2626; padding: 8px;">Error loading persons</div>';
+    showStatus(`Error loading persons: ${e.message}`, true);
+  }
+}
+
+async function reloadCentroids() {
+  try { 
+    const r = await fetch(`${base}/reload`, { method: 'POST' }); 
+    const data = await r.json();
+    setOut('personsOut', data);
+    showStatus('Centroids reloaded successfully');
+  }
+  catch(e){ 
+    setOut('personsOut', { error: String(e) }); 
+    showStatus(`Error reloading centroids: ${e.message}`, true);
+  }
+}
+
+async function deletePerson() {
+  const name = document.getElementById('deleteName').value.trim();
+  
+  if (!name) {
+    setOut('personsOut', { error: 'Name required' });
+    showStatus('Please enter a name to delete', true);
+    return;
+  }
+  
+  try { 
+    const r = await fetch(`${base}/person?name=${encodeURIComponent(name)}`, { method: 'DELETE' }); 
+    const data = await r.json();
+    setOut('personsOut', data);
+    
+    if (data.deleted > 0) {
+      showStatus(`Successfully deleted ${name}`);
+      document.getElementById('deleteName').value = '';
+      await listPersons();
+    } else {
+      showStatus(`Error: ${data.error}`, true);
+    }
+  }
+  catch(e){ 
+    setOut('personsOut', { error: String(e) }); 
+    showStatus(`Network error: ${e.message}`, true);
+  }
+}
+
+async function updatePersonName() {
+  const oldName = document.getElementById('updateOldName').value.trim();
+  const newName = document.getElementById('updateNewName').value.trim();
+  
+  if (!oldName || !newName) {
+    setOut('personsOut', { error: 'Both names required' });
+    showStatus('Please enter both current and new names', true);
+    return;
+  }
+  
+  try {
+    const res = await fetch(`${base}/person?old_name=${encodeURIComponent(oldName)}&new_name=${encodeURIComponent(newName)}`, { 
+      method: 'PUT' 
+    });
+    const data = await res.json();
+    setOut('personsOut', data);
+    
+    if (data.updated) {
+      showStatus(`Successfully updated '${oldName}' to '${newName}'`);
+      document.getElementById('updateOldName').value = '';
+      document.getElementById('updateNewName').value = '';
+      await listPersons();
+    } else {
+      showStatus(`Error: ${data.error}`, true);
+    }
+  } catch (e) {
+    setOut('personsOut', { error: String(e) });
+    showStatus(`Network error: ${e.message}`, true);
+  }
+}
+
+function fillUpdateForm(name) {
+  document.getElementById('updateOldName').value = name;
+  document.getElementById('updateNewName').value = '';
+  document.getElementById('updateNewName').focus();
+}
+
+function fillDeleteForm(name) {
+  document.getElementById('deleteName').value = name;
+}
+
+// Check server status on page load
+async function checkServerStatus() {
+  try {
+    const response = await fetch(`${base}/health`);
+    const data = await response.json();
+    
+    if (data.database === 'connected') {
+      showStatus('Server connected and database ready!');
+    } else {
+      showStatus(`Warning: ${data.database}`, true);
+    }
+  } catch (e) {
+    showStatus('Cannot connect to server. Make sure the server is running!', true);
+  }
+}
+
+// Load persons list on page load
+document.addEventListener('DOMContentLoaded', function() {
+  checkServerStatus();
+  listPersons();
+});
+</script>
+</body>
+</html>
