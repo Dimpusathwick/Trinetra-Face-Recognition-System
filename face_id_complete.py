@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Face ID Complete - Working version with proper error handling
+Face ID Complete - Working version with YOLOX and SCRFD detection
 """
 
 import json
@@ -8,7 +8,7 @@ import uuid
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import mysql.connector
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, Query, HTTPException
@@ -17,6 +17,11 @@ from fastapi.responses import FileResponse
 import cv2
 from PIL import Image
 import io
+import torch
+from ultralytics import YOLO
+import insightface
+from insightface.app import FaceAnalysis
+import onnxruntime as ort
 
 # Database functions
 def get_conn():
@@ -210,26 +215,268 @@ def delete_person(name: str) -> int:
     """Legacy function - deletes by name"""
     return delete_identity_by_name(name)
 
-# Mock InsightFace service for testing
-class MockInsightFaceService:
+# YOLOX and SCRFD Detection Service
+class YOLOXSCRFDService:
     def __init__(self):
-        self.app = None
+        self.yolo_model = None
+        self.face_app = None
         self.centroids = {}
         self._lock = threading.Lock()
-        print("MockInsightFaceService initialized (no actual face detection)")
+        self._initialize_models()
     
-    def get_app(self):
-        if self.app is None:
-            # Mock app that doesn't actually do face detection
-            class MockApp:
-                def get(self, img):
-                    # Return a mock face with random embedding
-                    return [type('Face', (), {
-                        'bbox': [100, 100, 200, 200],
-                        'embedding': np.random.rand(512).astype(np.float32)
-                    })()]
-            self.app = MockApp()
-        return self.app
+    def _initialize_models(self):
+        """Initialize YOLOX and SCRFD models"""
+        try:
+            print("Initializing YOLOX person detection model...")
+            # Initialize YOLOX for person detection
+            self.yolo_model = YOLO('yolov8n.pt')  # Using YOLOv8 as YOLOX alternative
+            print("YOLOX model initialized successfully")
+            
+            print("Initializing SCRFD face detection model...")
+            # Initialize InsightFace with SCRFD
+            self.face_app = FaceAnalysis(
+                name='buffalo_l',  # Uses SCRFD for face detection
+                providers=['CPUExecutionProvider']  # Use CPU for compatibility
+            )
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+            print("SCRFD face detection model initialized successfully")
+            
+        except Exception as e:
+            print(f"Error initializing models: {e}")
+            print("Falling back to OpenCV Haar Cascades...")
+            self._initialize_fallback_models()
+    
+    def _initialize_fallback_models(self):
+        """Initialize fallback models using OpenCV"""
+        try:
+            # Fallback person detection using HOG
+            self.hog_detector = cv2.HOGDescriptor()
+            self.hog_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            
+            # Fallback face detection using Haar Cascades
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            
+            print("Fallback models initialized successfully")
+        except Exception as e:
+            print(f"Error initializing fallback models: {e}")
+    
+    def detect_persons_yolox(self, image: np.ndarray) -> List[Dict]:
+        """Detect persons using YOLOX/YOLOv8"""
+        try:
+            if self.yolo_model is None:
+                return self._detect_persons_fallback(image)
+            
+            # Run YOLO inference
+            results = self.yolo_model(image, verbose=False)
+            
+            person_boxes = []
+            for result in results:
+                boxes = result.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        # Check if it's a person (class 0 in COCO dataset)
+                        if int(box.cls) == 0:  # Person class
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = float(box.conf[0].cpu().numpy())
+                            
+                            person_boxes.append({
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': confidence,
+                                'class': 'person',
+                                'method': 'YOLOX/YOLOv8'
+                            })
+            
+            return person_boxes
+            
+        except Exception as e:
+            print(f"YOLOX detection error: {e}")
+            return self._detect_persons_fallback(image)
+    
+    def _detect_persons_fallback(self, image: np.ndarray) -> List[Dict]:
+        """Fallback person detection using HOG"""
+        try:
+            if not hasattr(self, 'hog_detector'):
+                return []
+            
+            # Convert to grayscale for HOG
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # Detect persons with HOG
+            persons, weights = self.hog_detector.detectMultiScale(
+                gray, 
+                winStride=(8, 8), 
+                padding=(8, 8), 
+                scale=1.05
+            )
+            
+            person_boxes = []
+            for i, (x, y, w, h) in enumerate(persons):
+                confidence = 0.8  # Default confidence for HOG
+                if len(weights) > i and len(weights[i]) > 0:
+                    confidence = float(weights[i][0])
+                
+                person_boxes.append({
+                    'bbox': [int(x), int(y), int(x + w), int(y + h)],
+                    'confidence': confidence,
+                    'class': 'person',
+                    'method': 'HOG (Fallback)'
+                })
+            
+            return person_boxes
+            
+        except Exception as e:
+            print(f"HOG detection error: {e}")
+            return []
+    
+    def detect_faces_scrfd(self, image: np.ndarray) -> List[Dict]:
+        """Detect faces using SCRFD"""
+        try:
+            if self.face_app is None:
+                return self._detect_faces_fallback(image)
+            
+            # Run SCRFD face detection
+            faces = self.face_app.get(image)
+            
+            face_boxes = []
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                face_boxes.append({
+                    'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                    'confidence': float(face.det_score),
+                    'embedding': face.embedding,
+                    'landmarks': face.kps.tolist() if hasattr(face, 'kps') else [],
+                    'method': 'SCRFD'
+                })
+            
+            return face_boxes
+            
+        except Exception as e:
+            print(f"SCRFD detection error: {e}")
+            return self._detect_faces_fallback(image)
+    
+    def _detect_faces_fallback(self, image: np.ndarray) -> List[Dict]:
+        """Fallback face detection using Haar Cascades"""
+        try:
+            if not hasattr(self, 'face_cascade'):
+                return []
+            
+            # Convert to grayscale for face detection
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # Detect faces
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30)
+            )
+            
+            face_boxes = []
+            for (x, y, w, h) in faces:
+                # Extract face region for embedding
+                face_roi = image[y:y+h, x:x+w]
+                embedding = self._extract_simple_embedding(face_roi)
+                
+                face_boxes.append({
+                    'bbox': [int(x), int(y), int(x + w), int(y + h)],
+                    'confidence': 0.9,  # Default confidence for Haar
+                    'embedding': embedding,
+                    'landmarks': [],
+                    'method': 'Haar Cascade (Fallback)'
+                })
+            
+            return face_boxes
+            
+        except Exception as e:
+            print(f"Haar detection error: {e}")
+            return []
+    
+    def _extract_simple_embedding(self, face_image: np.ndarray) -> np.ndarray:
+        """Extract simple features from face image for embedding"""
+        try:
+            # Resize to standard size
+            face_resized = cv2.resize(face_image, (64, 64))
+            
+            # Convert to grayscale if needed
+            if len(face_resized.shape) == 3:
+                face_gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+            else:
+                face_gray = face_resized
+            
+            # Flatten and normalize
+            features = face_gray.flatten().astype(np.float32)
+            features = features / 255.0  # Normalize to [0, 1]
+            
+            return features
+            
+        except Exception as e:
+            print(f"Feature extraction error: {e}")
+            return np.zeros(64 * 64, dtype=np.float32)
+    
+    def detect_and_embed(self, image_bytes: bytes) -> Tuple[List[Dict], List[np.ndarray]]:
+        """Detect persons and faces, then extract embeddings"""
+        try:
+            # Decode image
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError("Could not decode image")
+            
+            # 1. Person Detection (YOLOX)
+            person_boxes = self.detect_persons_yolox(img)
+            
+            detected_faces_info = []
+            embeddings = []
+            
+            # 2. Face Detection (SCRFD) within person regions
+            for person_box in person_boxes:
+                px1, py1, px2, py2 = person_box['bbox']
+                person_roi = img[py1:py2, px1:px2]
+                
+                if person_roi.size == 0:
+                    continue
+                
+                # Detect faces within person ROI
+                faces_in_roi = self.detect_faces_scrfd(person_roi)
+                
+                for face_box in faces_in_roi:
+                    fx1, fy1, fx2, fy2 = face_box['bbox']
+                    face_img = person_roi[fy1:fy2, fx1:fx2]
+                    
+                    if face_img.size == 0:
+                        continue
+                    
+                    # Get embedding
+                    embedding = face_box.get('embedding', self._extract_simple_embedding(face_img))
+                    embeddings.append(embedding)
+                    
+                    # Adjust face bbox to original image coordinates
+                    global_fx1 = px1 + fx1
+                    global_fy1 = py1 + fy1
+                    global_fx2 = px1 + fx2
+                    global_fy2 = py1 + fy2
+                    
+                    detected_faces_info.append({
+                        "bbox": [global_fx1, global_fy1, global_fx2, global_fy2],
+                        "det_score": face_box.get('confidence', 0.9),
+                        "landmarks": face_box.get('landmarks', []),
+                        "person_bbox": [px1, py1, px2, py2],
+                        "person_confidence": person_box.get('confidence', 0.8),
+                        "detection_method": face_box.get('method', 'Unknown')
+                    })
+            
+            return detected_faces_info, embeddings
+            
+        except Exception as e:
+            print(f"Detection and embedding error: {e}")
+            return [], []
     
     def reload_centroids(self):
         with self._lock:
@@ -243,9 +490,26 @@ class MockInsightFaceService:
     def get_centroids(self):
         with self._lock:
             return self.centroids.copy()
+    
+    def get_detection_methods(self) -> Dict[str, str]:
+        """Get information about detection methods"""
+        methods = {
+            "person_detection": "YOLOX/YOLOv8",
+            "face_detection": "SCRFD",
+            "embedding_method": "InsightFace/OpenCV Feature Extraction"
+        }
+        
+        # Check if fallback methods are being used
+        if not hasattr(self, 'yolo_model') or self.yolo_model is None:
+            methods["person_detection"] = "HOG (Fallback)"
+        
+        if not hasattr(self, 'face_app') or self.face_app is None:
+            methods["face_detection"] = "Haar Cascade (Fallback)"
+        
+        return methods
 
 # Global service instance
-service = MockInsightFaceService()
+service = YOLOXSCRFDService()
 
 # FastAPI app
 app = FastAPI(title="Face ID API", version="1.0.0")
@@ -263,7 +527,17 @@ async def health_check():
         # Test database connection
         conn = get_conn()
         conn.close()
-        return {"status": "ok", "message": "Face ID API is running", "database": "connected"}
+        
+        # Get detection methods info
+        detection_methods = service.get_detection_methods()
+        
+        return {
+            "status": "ok", 
+            "message": "Face ID API is running", 
+            "database": "connected",
+            "detection_methods": detection_methods,
+            "centroids_loaded": len(service.get_centroids())
+        }
     except Exception as e:
         return {"status": "error", "message": "Face ID API is running", "database": f"disconnected: {e}"}
 
@@ -272,25 +546,30 @@ async def add_photo(person_name: str = Form(...), file: UploadFile = File(...)):
     try:
         # Read image
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        image_array = np.array(image)
         
-        # Mock face detection - just create a random embedding
-        app = service.get_app()
-        faces = app.get(image_array)
+        # Use YOLOX and SCRFD for detection
+        detected_faces_info, embeddings = service.detect_and_embed(contents)
         
-        if not faces:
+        if not detected_faces_info or not embeddings:
             return {"success": False, "error": "No face detected in image"}
         
-        face = faces[0]
-        embedding = face.embedding
+        # Use the first detected face
+        face_info = detected_faces_info[0]
+        embedding = embeddings[0]
         
         # Add to database
         identity_id = add_person_with_embedding(
             person_name, 
             embedding, 
-            quality=0.8,  # Mock quality
-            metadata={"source": "upload", "file_name": file.filename}
+            quality=float(face_info.get('det_score', 0.8)),
+            metadata={
+                "source": "upload", 
+                "file_name": file.filename,
+                "detection_method": face_info.get('detection_method', 'Unknown'),
+                "person_confidence": face_info.get('person_confidence', 0.8),
+                "face_bbox": face_info.get('bbox', []),
+                "person_bbox": face_info.get('person_bbox', [])
+            }
         )
         
         # Reload centroids
@@ -300,7 +579,10 @@ async def add_photo(person_name: str = Form(...), file: UploadFile = File(...)):
             "success": True, 
             "message": f"Added {person_name} to database",
             "identity_id": identity_id,
-            "faces_detected": len(faces)
+            "faces_detected": len(detected_faces_info),
+            "detection_method": face_info.get('detection_method', 'Unknown'),
+            "face_confidence": face_info.get('det_score', 0.8),
+            "person_confidence": face_info.get('person_confidence', 0.8)
         }
         
     except Exception as e:
@@ -311,18 +593,16 @@ async def match_photo(file: UploadFile = File(...)):
     try:
         # Read image
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        image_array = np.array(image)
         
-        # Mock face detection
-        app = service.get_app()
-        faces = app.get(image_array)
+        # Use YOLOX and SCRFD for detection
+        detected_faces_info, embeddings = service.detect_and_embed(contents)
         
-        if not faces:
+        if not detected_faces_info or not embeddings:
             return {"match": None, "similarity": 0.0, "error": "No face detected"}
         
-        face = faces[0]
-        embedding = face.embedding
+        # Use the first detected face
+        face_info = detected_faces_info[0]
+        embedding = embeddings[0]
         
         # Compare with centroids
         centroids = service.get_centroids()
@@ -342,7 +622,10 @@ async def match_photo(file: UploadFile = File(...)):
         return {
             "match": best_match if best_similarity > 0.35 else None,
             "similarity": float(best_similarity),
-            "faces_detected": len(faces)
+            "faces_detected": len(detected_faces_info),
+            "detection_method": face_info.get('detection_method', 'Unknown'),
+            "face_confidence": face_info.get('det_score', 0.8),
+            "person_confidence": face_info.get('person_confidence', 0.8)
         }
         
     except Exception as e:
@@ -406,7 +689,19 @@ async def update_person_name(old_name: str = Query(...), new_name: str = Query(.
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Face ID API server...")
+    print("Starting Face ID API server with YOLOX and SCRFD...")
     print("Open http://127.0.0.1:8000 in your browser")
     print("Make sure XAMPP MySQL is running!")
+    
+    # Initialize centroids on startup
+    try:
+        service.reload_centroids()
+        print(f"Loaded {len(service.get_centroids())} person centroids")
+    except Exception as e:
+        print(f"Warning: Could not load centroids: {e}")
+    
+    # Print detection methods
+    methods = service.get_detection_methods()
+    print(f"Detection methods: {methods}")
+    
     uvicorn.run(app, host="127.0.0.1", port=8000)

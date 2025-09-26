@@ -40,7 +40,7 @@
         <input id="addFile" type="file" accept="image/*">
         <button onclick="addPhoto()">Upload</button>
       </div>
-      <small>Uploads the image, extracts the face embedding, stores it, then refreshes centroids.</small>
+      <small>Uses YOLOX-style person detection + SCRFD-style face detection</small>
       <h3>Result</h3><pre id="addOut"></pre>
     </div>
 
@@ -50,7 +50,7 @@
         <input id="matchFile" type="file" accept="image/*">
         <button class="secondary" onclick="matchPhoto()">Match</button>
       </div>
-      <small>Runs recognition against current centroids.</small>
+      <small>Find matching person in database</small>
       <h3>Result</h3><pre id="matchOut"></pre>
     </div>
 
@@ -75,7 +75,7 @@
         <button class="secondary" onclick="listPersons()">Refresh List</button>
         <button onclick="reloadCentroids()">Reload Centroids</button>
       </div>
-      <small>Use Reload after adding/deleting photos.</small>
+      <small>List all registered persons</small>
       <h3>Persons</h3>
       <div id="personsList" style="margin-bottom: 12px;"></div>
       <pre id="personsOut"></pre>
@@ -438,7 +438,10 @@ async function checkServerStatus() {
     const data = await response.json();
     
     if (data.database === 'connected') {
-      showStatus('Server connected and database ready!');
+      const methods = data.detection_methods || {};
+      const personDet = methods.person_detection || 'Unknown';
+      const faceDet = methods.face_detection || 'Unknown';
+      showStatus(`Server ready! Detection: ${personDet} + ${faceDet}`);
     } else {
       showStatus(`Warning: ${data.database}`, true);
     }
