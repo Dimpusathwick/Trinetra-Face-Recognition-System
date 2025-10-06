@@ -97,6 +97,7 @@ const base = location.origin;
 let stream = null;
 let detectionInterval = null;
 let tempPersonCounter = 1;
+let lastDetectedMatchName = null; // track last known match from webcam
 
 function setOut(id, obj) {
   try { 
@@ -193,12 +194,14 @@ async function detectFaces() {
       
       // Use server's decision - if match is "Unknown", treat as unknown
       if (data.match && data.match !== "Unknown") {
+        lastDetectedMatchName = data.match;
         setOut('webcamOut', { 
           detected: data.match, 
           similarity: data.similarity,
           status: 'known_person'
         });
       } else {
+        lastDetectedMatchName = null;
         setOut('webcamOut', { 
           detected: 'Unknown', 
           similarity: data.similarity,
@@ -226,13 +229,13 @@ async function captureAndAdd() {
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0);
   
-  // Generate temporary name
-  const tempName = `Person_${tempPersonCounter++}`;
+  // If webcam identified a known person, append under that name; else use temporary
+  const targetName = lastDetectedMatchName ? lastDetectedMatchName : `Person_${tempPersonCounter++}`;
   
   // Convert to blob and send
   canvas.toBlob(async (blob) => {
     const fd = new FormData();
-    fd.append('person_name', tempName);
+    fd.append('person_name', targetName);
     fd.append('file', blob, 'capture.jpg');
     
     try {
@@ -240,8 +243,13 @@ async function captureAndAdd() {
       const data = await res.json();
       setOut('webcamOut', { 
         ...data, 
-        message: `Added as ${tempName}. You can update the name later.`
+        message: lastDetectedMatchName
+          ? `Appended photo to existing person: ${targetName}`
+          : `Added as ${targetName}. You can update the name later.`
       });
+      if (data.clustered) {
+        showStatus(`clustered to existing id: ${data.identity_id}`);
+      }
       // Refresh persons list
       await listPersons();
     } catch (e) {
@@ -276,6 +284,9 @@ async function addPhoto() {
     
     if (data.success) {
       showStatus(`Successfully added ${name} to database!`);
+      if (data.clustered) {
+        showStatus(`clustered to existing id: ${data.identity_id}`);
+      }
       // Clear form
       document.getElementById('personName').value = '';
       document.getElementById('addFile').value = '';

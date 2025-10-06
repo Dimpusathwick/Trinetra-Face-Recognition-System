@@ -63,6 +63,19 @@ def add_identity(name: str, metadata: Dict = None) -> str:
     finally:
         cx.close()
 
+def get_identity_by_name(name: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Return (identity_id, embedding_id) by exact name if exists, else None"""
+    cx = get_conn()
+    try:
+        cur = cx.cursor()
+        cur.execute("SELECT id, embedding_id FROM identities WHERE name = %s", (name,))
+        row = cur.fetchone()
+        if row:
+            return row[0], row[1]
+        return None
+    finally:
+        cx.close()
+
 def add_embedding(vector: np.ndarray, quality: float = 0.0, source_id: str = None) -> str:
     """Add a new embedding and return the UUID"""
     embedding_id = str(uuid.uuid4())
@@ -97,37 +110,65 @@ def link_identity_to_embedding(identity_id: str, embedding_id: str) -> None:
     finally:
         cx.close()
 
-def add_person_with_embedding(name: str, embedding: np.ndarray, quality: float = 0.0, metadata: Dict = None) -> str:
-    """Add a person with their embedding - returns identity_id"""
-    identity_id = add_identity(name, metadata)
-    embedding_id = add_embedding(embedding, quality)
-    link_identity_to_embedding(identity_id, embedding_id)
-    return identity_id
+def add_person_with_embedding(name: str, embedding: np.ndarray, quality: float = 0.0, metadata: Dict = None) -> Tuple[str, bool]:
+    """Add or append an embedding for a person name.
+    Returns (identity_id, clustered_to_existing).
+    clustered_to_existing=True when appended under an existing identity.
+    """
+    # If identity exists, append embedding; else create identity and set primary
+    existing = get_identity_by_name(name)
+    if existing is None:
+        identity_id = add_identity(name, metadata)
+        embedding_id = add_embedding(embedding, quality, source_id=identity_id)
+        link_identity_to_embedding(identity_id, embedding_id)
+        return identity_id, False
+    else:
+        identity_id, _primary_embedding = existing
+        # Append new embedding linked to this identity
+        _ = add_embedding(embedding, quality, source_id=identity_id)
+        # Optionally update primary to the most recent high-quality one; keep current for now
+        return identity_id, True
 
 def load_person_centroids() -> Dict[str, np.ndarray]:
-    """Load centroids for all identities"""
+    """Load centroids for all identities by averaging all their embeddings."""
     cx = get_conn()
     try:
         cur = cx.cursor()
-        cur.execute("""
-            SELECT i.name, e.vector, e.quality
-            FROM identities i
-            JOIN embeddings e ON e.id = i.embedding_id
-            WHERE e.vector IS NOT NULL
-        """)
-        
-        name_to_vecs: Dict[str, List[np.ndarray]] = {}
-        for name, vector_json, quality in cur.fetchall():
-            vec = np.array(json.loads(vector_json), dtype=np.float32)
-            name_to_vecs.setdefault(name, []).append(vec)
-        
+        # Fetch all identities
+        cur.execute("SELECT id, name, embedding_id FROM identities")
+        identities = cur.fetchall()  # list of (id, name, embedding_id)
+
         centroids: Dict[str, np.ndarray] = {}
-        for name, vecs in name_to_vecs.items():
-            stack = np.vstack(vecs)
+        for identity_id, name, primary_embedding_id in identities:
+            # Collect all embeddings linked to this identity: source_id = identity_id
+            cur2 = cx.cursor()
+            cur2.execute(
+                "SELECT vector FROM embeddings WHERE source_id = %s",
+                (identity_id,)
+            )
+            rows = cur2.fetchall()
+            vectors: List[np.ndarray] = []
+            for (vector_json,) in rows:
+                if vector_json:
+                    vec = np.array(json.loads(vector_json), dtype=np.float32)
+                    vectors.append(vec)
+
+            # Also include the primary embedding if set and not already included
+            if primary_embedding_id:
+                cur2.execute("SELECT vector FROM embeddings WHERE id = %s", (primary_embedding_id,))
+                rowp = cur2.fetchone()
+                if rowp and rowp[0]:
+                    vecp = np.array(json.loads(rowp[0]), dtype=np.float32)
+                    vectors.append(vecp)
+
+            if not vectors:
+                continue
+
+            stack = np.vstack(vectors)
             c = stack.mean(axis=0)
             c = c / (np.linalg.norm(c) + 1e-12)
             centroids[name] = c.astype(np.float32)
-        
+
         return centroids
     finally:
         cx.close()
@@ -558,7 +599,7 @@ async def add_photo(person_name: str = Form(...), file: UploadFile = File(...)):
         embedding = embeddings[0]
         
         # Add to database
-        identity_id = add_person_with_embedding(
+        identity_id, clustered = add_person_with_embedding(
             person_name, 
             embedding, 
             quality=float(face_info.get('det_score', 0.8)),
@@ -579,6 +620,7 @@ async def add_photo(person_name: str = Form(...), file: UploadFile = File(...)):
             "success": True, 
             "message": f"Added {person_name} to database",
             "identity_id": identity_id,
+            "clustered": clustered,
             "faces_detected": len(detected_faces_info),
             "detection_method": face_info.get('detection_method', 'Unknown'),
             "face_confidence": face_info.get('det_score', 0.8),
