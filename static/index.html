@@ -191,10 +191,8 @@ async function detectFaces() {
       const res = await fetch(`${base}/match`, { method: 'POST', body: fd });
       const data = await res.json();
       
-      // Strict threshold - only very similar faces match
-      const threshold = 0.6;
-      
-      if (data.match && data.similarity >= threshold) {
+      // Use server's decision - if match is "Unknown", treat as unknown
+      if (data.match && data.match !== "Unknown") {
         setOut('webcamOut', { 
           detected: data.match, 
           similarity: data.similarity,

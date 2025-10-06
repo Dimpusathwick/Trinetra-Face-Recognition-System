@@ -607,20 +607,29 @@ async def match_photo(file: UploadFile = File(...)):
         # Compare with centroids
         centroids = service.get_centroids()
         if not centroids:
-            return {"match": None, "similarity": 0.0, "message": "No persons in database"}
+            return {"match": "Unknown", "similarity": 0.0, "message": "No persons in database"}
         
         best_match = None
         best_similarity = 0.0
         
+        # Normalize the input embedding
+        embedding_norm = embedding / (np.linalg.norm(embedding) + 1e-12)
+        
+        print(f"DEBUG: Comparing with {len(centroids)} centroids")
         for name, centroid in centroids.items():
             # Calculate cosine similarity
-            similarity = np.dot(embedding, centroid)
+            similarity = np.dot(embedding_norm, centroid)
+            print(f"DEBUG: Similarity with {name}: {similarity:.4f}")
+            
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match = name
         
+        print(f"DEBUG: Best match: {best_match}, Best similarity: {best_similarity:.4f}")
+        print(f"DEBUG: Threshold: 0.5, Will match: {best_similarity > 0.5}")
+        
         return {
-            "match": best_match if best_similarity > 0.35 else None,
+            "match": best_match if best_similarity > 0.5 else "Unknown",
             "similarity": float(best_similarity),
             "faces_detected": len(detected_faces_info),
             "detection_method": face_info.get('detection_method', 'Unknown'),
