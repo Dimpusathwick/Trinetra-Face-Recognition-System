@@ -203,6 +203,19 @@ def list_identities() -> List[Dict]:
     finally:
         cx.close()
 
+def get_identity_by_id(identity_id: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """Return (id, name, embedding_id) by id if exists, else None"""
+    cx = get_conn()
+    try:
+        cur = cx.cursor()
+        cur.execute("SELECT id, name, embedding_id FROM identities WHERE id = %s", (identity_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], row[1], row[2]
+        return None
+    finally:
+        cx.close()
+
 def delete_identity(identity_id: str) -> int:
     """Delete an identity and its embeddings"""
     cx = get_conn()
@@ -239,6 +252,58 @@ def update_identity_name_by_old_name(old_name: str, new_name: str) -> bool:
     finally:
         cx.close()
 
+def load_person_centroids_with_ids() -> Tuple[Dict[str, np.ndarray], Dict[str, str]]:
+    """Load centroids keyed by identity_id and return also id->name map."""
+    cx = get_conn()
+    try:
+        cur = cx.cursor()
+        cur.execute("SELECT id, name, embedding_id FROM identities")
+        identities = cur.fetchall()  # (id, name, embedding_id)
+
+        centroids_by_id: Dict[str, np.ndarray] = {}
+        id_to_name: Dict[str, str] = {}
+        for identity_id, name, primary_embedding_id in identities:
+            id_to_name[identity_id] = name
+            cur2 = cx.cursor()
+            cur2.execute("SELECT vector FROM embeddings WHERE source_id = %s", (identity_id,))
+            rows = cur2.fetchall()
+            vectors: List[np.ndarray] = []
+            for (vector_json,) in rows:
+                if vector_json:
+                    vec = np.array(json.loads(vector_json), dtype=np.float32)
+                    vectors.append(vec)
+
+            if primary_embedding_id:
+                cur2.execute("SELECT vector FROM embeddings WHERE id = %s", (primary_embedding_id,))
+                rowp = cur2.fetchone()
+                if rowp and rowp[0]:
+                    vecp = np.array(json.loads(rowp[0]), dtype=np.float32)
+                    vectors.append(vecp)
+
+            if not vectors:
+                continue
+
+            stack = np.vstack(vectors)
+            c = stack.mean(axis=0)
+            c = c / (np.linalg.norm(c) + 1e-12)
+            centroids_by_id[identity_id] = c.astype(np.float32)
+
+        return centroids_by_id, id_to_name
+    finally:
+        cx.close()
+
+def add_embedding_to_identity(identity_id: str, embedding: np.ndarray, quality: float = 0.0, metadata: Dict = None) -> Tuple[str, bool]:
+    """Append an embedding under an existing identity id. Returns (identity_id, clustered=True)."""
+    existing = get_identity_by_id(identity_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Identity id '{identity_id}' not found")
+    _id, _name, primary_embedding_id = existing
+    embedding_id = add_embedding(embedding, quality, source_id=identity_id)
+    # If there is no primary embedding yet, set this one
+    if not primary_embedding_id:
+        link_identity_to_embedding(identity_id, embedding_id)
+    return identity_id, True
+
 # Legacy functions for backward compatibility
 def list_persons() -> List[Dict]:
     """Legacy function - returns simplified person list"""
@@ -262,6 +327,8 @@ class YOLOXSCRFDService:
         self.yolo_model = None
         self.face_app = None
         self.centroids = {}
+        self.centroids_by_id = {}
+        self.id_to_name: Dict[str, str] = {}
         self._lock = threading.Lock()
         self._initialize_models()
     
@@ -388,7 +455,8 @@ class YOLOXSCRFDService:
                 face_boxes.append({
                     'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
                     'confidence': float(face.det_score),
-                    'embedding': face.embedding,
+                    # Prefer normalized ArcFace embedding when available
+                    'embedding': getattr(face, 'normed_embedding', getattr(face, 'embedding', None)),
                     'landmarks': face.kps.tolist() if hasattr(face, 'kps') else [],
                     'method': 'SCRFD'
                 })
@@ -523,21 +591,29 @@ class YOLOXSCRFDService:
         with self._lock:
             try:
                 self.centroids = load_person_centroids()
+                # Also load id-indexed centroids and id->name mapping
+                self.centroids_by_id, self.id_to_name = load_person_centroids_with_ids()
                 print(f"Loaded {len(self.centroids)} person centroids")
             except Exception as e:
                 print(f"Error loading centroids: {e}")
                 self.centroids = {}
+                self.centroids_by_id = {}
+                self.id_to_name = {}
     
     def get_centroids(self):
         with self._lock:
             return self.centroids.copy()
+
+    def get_centroids_by_id(self):
+        with self._lock:
+            return self.centroids_by_id.copy(), self.id_to_name.copy()
     
     def get_detection_methods(self) -> Dict[str, str]:
         """Get information about detection methods"""
         methods = {
             "person_detection": "YOLOX/YOLOv8",
             "face_detection": "SCRFD",
-            "embedding_method": "InsightFace/OpenCV Feature Extraction"
+            "embedding_method": "ArcFace (512D)"
         }
         
         # Check if fallback methods are being used
@@ -546,6 +622,7 @@ class YOLOXSCRFDService:
         
         if not hasattr(self, 'face_app') or self.face_app is None:
             methods["face_detection"] = "Haar Cascade (Fallback)"
+            methods["embedding_method"] = "Grayscale-4096D (Fallback)"
         
         return methods
 
@@ -630,6 +707,52 @@ async def add_photo(person_name: str = Form(...), file: UploadFile = File(...)):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+@app.post("/person/create")
+async def create_person(name: str = Form(...)):
+    try:
+        existing = get_identity_by_name(name)
+        if existing is not None:
+            return {"success": True, "identity_id": existing[0], "message": "Person already exists"}
+        identity_id = add_identity(name, metadata={"source": "manual"})
+        service.reload_centroids()
+        return {"success": True, "identity_id": identity_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/add_photo_to_id")
+async def add_photo_to_id(identity_id: str = Form(...), file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        detected_faces_info, embeddings = service.detect_and_embed(contents)
+        if not detected_faces_info or not embeddings:
+            return {"success": False, "error": "No face detected in image"}
+        face_info = detected_faces_info[0]
+        embedding = embeddings[0]
+        _identity_id, clustered = add_embedding_to_identity(
+            identity_id,
+            embedding,
+            quality=float(face_info.get('det_score', 0.8)),
+            metadata={
+                "source": "upload_to_id",
+                "file_name": file.filename,
+                "detection_method": face_info.get('detection_method', 'Unknown'),
+                "person_confidence": face_info.get('person_confidence', 0.8),
+                "face_bbox": face_info.get('bbox', []),
+                "person_bbox": face_info.get('person_bbox', [])
+            }
+        )
+        service.reload_centroids()
+        return {
+            "success": True,
+            "identity_id": identity_id,
+            "clustered": clustered,
+            "faces_detected": len(detected_faces_info)
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.post("/match")
 async def match_photo(file: UploadFile = File(...)):
     try:
@@ -652,12 +775,15 @@ async def match_photo(file: UploadFile = File(...)):
             return {"match": "Unknown", "similarity": 0.0, "message": "No persons in database"}
         
         best_match = None
+        best_match_id = None
         best_similarity = 0.0
         
         # Normalize the input embedding
         embedding_norm = embedding / (np.linalg.norm(embedding) + 1e-12)
         
         print(f"DEBUG: Comparing with {len(centroids)} centroids")
+        # Also compute by identity_id for stable IDs
+        centroids_by_id, id_to_name = service.get_centroids_by_id()
         for name, centroid in centroids.items():
             # Calculate cosine similarity
             similarity = np.dot(embedding_norm, centroid)
@@ -666,6 +792,12 @@ async def match_photo(file: UploadFile = File(...)):
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match = name
+                # find corresponding id if exists
+                # linear search on id_to_name (small cardinality in typical usage)
+                for _id, _nm in id_to_name.items():
+                    if _nm == name:
+                        best_match_id = _id
+                        break
         
         print(f"DEBUG: Best match: {best_match}, Best similarity: {best_similarity:.4f}")
         print(f"DEBUG: Threshold: 0.5, Will match: {best_similarity > 0.5}")
@@ -673,6 +805,7 @@ async def match_photo(file: UploadFile = File(...)):
         return {
             "match": best_match if best_similarity > 0.5 else "Unknown",
             "similarity": float(best_similarity),
+            "match_identity_id": best_match_id if best_similarity > 0.5 else None,
             "faces_detected": len(detected_faces_info),
             "detection_method": face_info.get('detection_method', 'Unknown'),
             "face_confidence": face_info.get('det_score', 0.8),

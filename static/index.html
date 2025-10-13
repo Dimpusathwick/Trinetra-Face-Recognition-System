@@ -40,7 +40,7 @@
         <input id="addFile" type="file" accept="image/*">
         <button onclick="addPhoto()">Upload</button>
       </div>
-      <small>Uses YOLOX-style person detection + SCRFD-style face detection</small>
+      <small>Uses YOLOX-style person detection + SCRFD face detection + ArcFace (512D) embeddings</small>
       <h3>Result</h3><pre id="addOut"></pre>
     </div>
 
@@ -61,6 +61,7 @@
         <button class="secondary" onclick="stopWebcam()">Stop Camera</button>
         <button class="success" onclick="captureAndAdd()">Capture & Add</button>
       </div>
+      <small>When a known face is detected, new captures are added to the same person ID.</small>
       <div class="webcam-container">
         <video id="webcamVideo" width="320" height="240" style="display:none;"></video>
         <canvas id="webcamCanvas" width="320" height="240" style="display:none;"></canvas>
@@ -98,6 +99,7 @@ let stream = null;
 let detectionInterval = null;
 let tempPersonCounter = 1;
 let lastDetectedMatchName = null; // track last known match from webcam
+let lastDetectedMatchId = null;   // track last known identity id
 
 function setOut(id, obj) {
   try { 
@@ -195,6 +197,7 @@ async function detectFaces() {
       // Use server's decision - if match is "Unknown", treat as unknown
       if (data.match && data.match !== "Unknown") {
         lastDetectedMatchName = data.match;
+        lastDetectedMatchId = data.match_identity_id || null;
         setOut('webcamOut', { 
           detected: data.match, 
           similarity: data.similarity,
@@ -202,6 +205,7 @@ async function detectFaces() {
         });
       } else {
         lastDetectedMatchName = null;
+        lastDetectedMatchId = null;
         setOut('webcamOut', { 
           detected: 'Unknown', 
           similarity: data.similarity,
@@ -229,17 +233,25 @@ async function captureAndAdd() {
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0);
   
-  // If webcam identified a known person, append under that name; else use temporary
+  // If webcam identified a known person, append under that identity id; else use temporary name flow
   const targetName = lastDetectedMatchName ? lastDetectedMatchName : `Person_${tempPersonCounter++}`;
   
   // Convert to blob and send
   canvas.toBlob(async (blob) => {
     const fd = new FormData();
-    fd.append('person_name', targetName);
-    fd.append('file', blob, 'capture.jpg');
+    // If we have a stable identity id, use the new endpoint to append to that id
+    if (lastDetectedMatchId) {
+      fd.append('identity_id', lastDetectedMatchId);
+      fd.append('file', blob, 'capture.jpg');
+      var endpoint = `${base}/add_photo_to_id`;
+    } else {
+      fd.append('person_name', targetName);
+      fd.append('file', blob, 'capture.jpg');
+      var endpoint = `${base}/add_photo`;
+    }
     
     try {
-      const res = await fetch(`${base}/add_photo`, { method: 'POST', body: fd });
+      const res = await fetch(endpoint, { method: 'POST', body: fd });
       const data = await res.json();
       setOut('webcamOut', { 
         ...data, 
