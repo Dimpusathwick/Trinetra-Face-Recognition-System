@@ -330,7 +330,14 @@ class YOLOXSCRFDService:
         self.centroids_by_id = {}
         self.id_to_name: Dict[str, str] = {}
         self._lock = threading.Lock()
-        self._initialize_models()
+        # Lazy/heavy initialization control
+        self._models_initialized = False
+        self._init_failed = False
+        self._fast_start = os.getenv("FAST_START", "0") == "1"
+        # If FAST_START is enabled, prefer lightweight fallbacks immediately
+        if self._fast_start:
+            print("FAST_START=1 detected: using fallback detectors (no heavy model downloads on startup)")
+            self._initialize_fallback_models()
     
     def _initialize_models(self):
         """Initialize YOLOX and SCRFD models"""
@@ -348,11 +355,13 @@ class YOLOXSCRFDService:
             )
             self.face_app.prepare(ctx_id=0, det_size=(640, 640))
             print("SCRFD face detection model initialized successfully")
+            self._models_initialized = True
             
         except Exception as e:
             print(f"Error initializing models: {e}")
             print("Falling back to OpenCV Haar Cascades...")
             self._initialize_fallback_models()
+            self._init_failed = True
     
     def _initialize_fallback_models(self):
         """Initialize fallback models using OpenCV"""
@@ -372,6 +381,9 @@ class YOLOXSCRFDService:
     def detect_persons_yolox(self, image: np.ndarray) -> List[Dict]:
         """Detect persons using YOLOX/YOLOv8"""
         try:
+            # Lazy init heavy models if not in FAST_START and not yet attempted
+            if not self._fast_start and not self._models_initialized and not self._init_failed:
+                self._initialize_models()
             if self.yolo_model is None:
                 return self._detect_persons_fallback(image)
             
@@ -443,6 +455,9 @@ class YOLOXSCRFDService:
     def detect_faces_scrfd(self, image: np.ndarray) -> List[Dict]:
         """Detect faces using SCRFD"""
         try:
+            # Lazy init heavy models if not in FAST_START and not yet attempted
+            if not self._fast_start and not self._models_initialized and not self._init_failed:
+                self._initialize_models()
             if self.face_app is None:
                 return self._detect_faces_fallback(image)
             
