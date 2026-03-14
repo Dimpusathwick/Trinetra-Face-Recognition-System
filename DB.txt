@@ -1,34 +1,10 @@
--- MySQL schema for Face ID (identities + embeddings)
--- Run this SQL in your MySQL server (database: faceid)
-
-CREATE DATABASE IF NOT EXISTS faceid DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE faceid;
-
--- identities table: stores logical person records
-CREATE TABLE IF NOT EXISTS identities (
-    id VARCHAR(64) NOT NULL PRIMARY KEY,
-    name VARCHAR(191) NOT NULL UNIQUE,
-    embedding_id VARCHAR(64) NULL,
-    metadata JSON NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
-
--- embeddings table: stores multiple embeddings per identity
-CREATE TABLE IF NOT EXISTS embeddings (
-    id VARCHAR(64) NOT NULL PRIMARY KEY,
-    vector JSON NOT NULL,
-    quality FLOAT NULL,
-    source_id VARCHAR(64) NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_source_id (source_id)
-);
-
--- optional: foreign key (commented to avoid issues when importing out of order)
--- ALTER TABLE identities
---   ADD CONSTRAINT fk_identities_embedding
---   FOREIGN KEY (embedding_id) REFERENCES embeddings(id)
---   ON DELETE SET NULL ON UPDATE CASCADE;
+http://127.0.0.1:8000/docs.
 
 
 
+
+
+
+
+
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload

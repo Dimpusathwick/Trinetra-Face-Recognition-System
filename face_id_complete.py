@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, UploadFile, Form, Query, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import cv2
-from PIL import Image
+from PIL import Image 
 import io
 import torch
 from ultralytics import YOLO
