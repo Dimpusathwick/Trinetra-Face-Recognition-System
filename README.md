@@ -131,17 +131,6 @@ Unknown face clustering
 Human-in-the-loop identity verification  
 Scalable backend architecture  
 
----
 
-# Future Improvements
 
-Real-time alert system for suspicious activity  
-Mobile notification integration  
-Edge device deployment  
-Improved model optimization for low-power devices  
 
----
-
-# License
-
-This project is intended for educational and research purposes.
